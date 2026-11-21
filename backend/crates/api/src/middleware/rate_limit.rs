@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, Response, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use std::collections::HashMap;
@@ -25,6 +25,8 @@ pub struct RateLimiter {
     buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
     public_rate: f64,
     auth_rate: f64,
+    public_max: f64,
+    auth_max: f64,
 }
 
 impl RateLimiter {
@@ -34,6 +36,20 @@ impl RateLimiter {
             // 60 public requests per minute, 120 for an authenticated caller.
             public_rate: 1.0,
             auth_rate: 2.0,
+            public_max: 60.0,
+            auth_max: 120.0,
+        }
+    }
+
+    /// Create a limiter with an explicit burst cap — useful in tests to
+    /// exhaust the bucket in a small number of requests.
+    pub fn with_capacity(public_max: f64, auth_max: f64) -> Self {
+        RateLimiter {
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            public_rate: public_max / 60.0,
+            auth_rate: auth_max / 60.0,
+            public_max,
+            auth_max,
         }
     }
 
@@ -41,7 +57,7 @@ impl RateLimiter {
         &self,
         ip: &str,
         is_authenticated: bool,
-    ) -> Result<(), (StatusCode, String)> {
+    ) -> Result<(), (StatusCode, u64)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -55,12 +71,11 @@ impl RateLimiter {
                 .retain(|_, bucket| now.saturating_sub(bucket.last_refill) < BUCKET_IDLE_TIMEOUT);
         }
 
-        let rate = if is_authenticated {
-            self.auth_rate
+        let (rate, max_tokens) = if is_authenticated {
+            (self.auth_rate, self.auth_max)
         } else {
-            self.public_rate
+            (self.public_rate, self.public_max)
         };
-        let max_tokens = if is_authenticated { 120.0 } else { 60.0 };
 
         let bucket = buckets
             .entry(ip.to_string())
@@ -74,10 +89,7 @@ impl RateLimiter {
 
         if new_tokens < 1.0 {
             let retry_after = ((1.0 - new_tokens) / rate).ceil() as u64;
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("Rate limit exceeded. Retry-After: {}", retry_after),
-            ));
+            return Err((StatusCode::TOO_MANY_REQUESTS, retry_after));
         }
 
         bucket.tokens = new_tokens - 1.0;
@@ -98,7 +110,7 @@ pub async fn rate_limit_middleware(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
     req: Request<Body>,
     next: Next,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, Response<Body>> {
     // The client address is absent when the app is served without connect
     // info (in-memory tests); such requests share one "unknown" bucket.
     let ip = req
@@ -106,12 +118,31 @@ pub async fn rate_limit_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let is_authenticated = req.headers().contains_key("authorization");
-    let _state = state; // Placeholder for future use (will extract rate_limiter from state)
 
-    // Use the rate limiter from state
-    let limiter = RateLimiter::new();
-    limiter.check_rate_limit(&ip, is_authenticated).await?;
+    // A request is authenticated only when its bearer token verifies — a
+    // header value that fails signature or expiry check counts as anonymous.
+    let (is_authenticated, bucket_key) = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|token| {
+            crate::auth::jwt::verify_token(token, state.config.jwt_secret.as_bytes()).ok()
+        })
+        .map(|claims| (true, claims.sub.to_string()))
+        .unwrap_or_else(|| (false, ip.clone()));
+
+    state
+        .rate_limiter
+        .check_rate_limit(&bucket_key, is_authenticated)
+        .await
+        .map_err(|(status, retry_after)| {
+            Response::builder()
+                .status(status)
+                .header(header::RETRY_AFTER, retry_after)
+                .body(Body::from("rate limit exceeded"))
+                .expect("valid response")
+        })?;
 
     Ok(next.run(req).await)
 }

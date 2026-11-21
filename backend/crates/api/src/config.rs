@@ -47,6 +47,15 @@ pub struct Config {
     /// Withdrawal amount (in USDC minor units, 7 decimals) at or above which a
     /// withdrawal is flagged for manual review (`WITHDRAWAL_REVIEW_THRESHOLD_USDC`).
     pub withdrawal_review_threshold_minor: i128,
+    /// Runtime environment. Set `ENGIPAY_ENV=production` to enable production
+    /// guards — the process refuses to start if any provider is a fake.
+    pub env: Env,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Env {
+    Development,
+    Production,
 }
 
 /// Default withdrawal review threshold: 100 USDC, in minor units.
@@ -198,6 +207,10 @@ impl Config {
             stellar_anchor_home_domain: env::var("STELLAR_ANCHOR_HOME_DOMAIN")
                 .unwrap_or_else(|_| "testanchor.stellar.org".to_owned()),
             withdrawal_review_threshold_minor,
+            env: match env::var("ENGIPAY_ENV").as_deref() {
+                Ok("production") => Env::Production,
+                _ => Env::Development,
+            },
         })
     }
 
@@ -229,6 +242,7 @@ impl Config {
             stellar_anchor_url: "https://testanchor.stellar.org".to_owned(),
             stellar_anchor_home_domain: "testanchor.stellar.org".to_owned(),
             withdrawal_review_threshold_minor: DEFAULT_REVIEW_THRESHOLD_MINOR,
+            env: Env::Development,
         }
     }
 }
