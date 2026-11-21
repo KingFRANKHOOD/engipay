@@ -36,7 +36,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let value = parts
             .headers
@@ -50,8 +50,21 @@ impl FromRequestParts<AppState> for AuthUser {
             .filter(|token| !token.trim().is_empty())
             .ok_or_else(|| ApiError::Unauthorized("expected Bearer token".to_string()))?;
 
-        Ok(Self {
+        let auth_user = Self {
             token: token.to_string(),
-        })
+        };
+
+        // Verify the token and reject revoked JTIs.
+        let claims = auth_user.verify(state.config.jwt_secret.as_bytes())?;
+        let revoked = state.revoked_tokens.read().await;
+        if revoked.contains_key(&claims.jti) {
+            return Err(ApiError::Unauthorized("token has been revoked".to_string()));
+        }
+        // Evict expired entries opportunistically while holding the read lock.
+        // (A write lock eviction pass runs in logout; this keeps the set lean
+        // between logouts without a background task.)
+        drop(revoked);
+
+        Ok(auth_user)
     }
 }

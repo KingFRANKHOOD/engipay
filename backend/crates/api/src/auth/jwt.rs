@@ -80,9 +80,6 @@ impl FaultInjection {
     }
 }
 
-/// The default lifetime of a session token.
-pub const DEFAULT_EXPIRY_SECONDS: i64 = 24 * 60 * 60;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claims {
     /// The authenticated user's id.
@@ -93,6 +90,8 @@ pub struct Claims {
     pub iat: i64,
     /// Expiry, Unix seconds.
     pub exp: i64,
+    /// Unique token ID — stored on logout to block reuse of a revoked token.
+    pub jti: Uuid,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,9 +108,7 @@ pub enum AuthError {
 /// [`DEFAULT_EXPIRY_SECONDS`] from now.
 pub fn create_token(user_id: Uuid, wallet: String, secret: &[u8]) -> Result<String, AuthError> {
     // Fault injection point: before creating token
-    if FaultInjection::maybe_crash() {
-        error!("fault injection crash before token creation");
-        // Return error to simulate crash
+    if FaultInjection::new().maybe_crash() {
         return Err(AuthError::TokenCreation);
     }
 
@@ -122,6 +119,7 @@ pub fn create_token(user_id: Uuid, wallet: String, secret: &[u8]) -> Result<Stri
         wallet,
         iat: now,
         exp: now.saturating_add(DEFAULT_EXPIRY_SECONDS),
+        jti: Uuid::new_v4(),
     };
 
     encode(
@@ -138,9 +136,7 @@ pub fn create_token(user_id: Uuid, wallet: String, secret: &[u8]) -> Result<Stri
 /// from a malformed or signature-invalid one.
 pub fn verify_token(token: &str, secret: &[u8]) -> Result<Claims, AuthError> {
     // Fault injection point: before verifying token
-    if FaultInjection::maybe_crash() {
-        error!("fault injection crash before token verification");
-        // Return error to simulate crash
+    if FaultInjection::new().maybe_crash() {
         return Err(AuthError::InvalidToken);
     }
 
@@ -160,10 +156,7 @@ pub fn verify_token(token: &str, secret: &[u8]) -> Result<Claims, AuthError> {
         })?;
 
     // Fault injection point: after verifying token but before returning claims
-    if FaultInjection::maybe_crash() {
-        error!(sub = ?data.claims.sub, "fault injection crash after token verification");
-        // Simulate crash after verification - caller must re-verify on restart
-    }
+    let _ = FaultInjection::new().maybe_crash();
 
     Ok(data.claims)
 }
@@ -230,6 +223,7 @@ mod tests {
             wallet: "wallet".to_string(),
             iat: current_timestamp() - 2 * DEFAULT_EXPIRY_SECONDS,
             exp: current_timestamp() - 1,
+            jti: Uuid::new_v4(),
         };
 
         let token = encode(

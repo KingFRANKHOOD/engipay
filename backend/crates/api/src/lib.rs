@@ -12,7 +12,10 @@ pub mod middleware;
 mod routes;
 pub mod services;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use axum::Router;
 use axum::http::{HeaderName, HeaderValue, Method, header};
@@ -51,6 +54,11 @@ pub struct AppState {
     pub destination_screen: Arc<dyn DestinationScreen>,
     /// Ed25519 signer used to issue verifiable transaction receipts.
     pub receipt_signer: Arc<ReceiptSigner>,
+    /// In-memory set of revoked token JTIs (jti → exp). Tokens whose jti
+    /// appears here are rejected even if the signature is valid. The DB
+    /// table is the durable store; this cache avoids a DB round-trip on
+    /// every authenticated request.
+    pub revoked_tokens: Arc<RwLock<HashMap<Uuid, i64>>>,
 }
 
 impl AppState {
@@ -67,7 +75,27 @@ impl AppState {
             bank_name_check: Arc::new(FakeBankNameCheck),
             destination_screen: Arc::new(StaticBlockList::empty()),
             receipt_signer: Arc::new(ReceiptSigner::from_config_or_test(&config)),
+            revoked_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl AppState {
+    /// Returns the names of any providers that are fakes. In production mode
+    /// (`ENGIPAY_ENV=production`) the caller should refuse to start if this
+    /// list is non-empty.
+    pub fn fake_providers(&self) -> Vec<&'static str> {
+        let mut fakes = Vec::new();
+        if std::any::type_name_of_val(self.price_source.as_ref()).contains("FakePriceSource") {
+            fakes.push("price_source (FakePriceSource)");
+        }
+        if std::any::type_name_of_val(self.kyc_provider.as_ref()).contains("FakeKycProvider") {
+            fakes.push("kyc_provider (FakeKycProvider)");
+        }
+        if std::any::type_name_of_val(self.bank_name_check.as_ref()).contains("FakeBankNameCheck") {
+            fakes.push("bank_name_check (FakeBankNameCheck)");
+        }
+        fakes
     }
 }
 

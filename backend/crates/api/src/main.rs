@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use engipay_api::middleware::rate_limit::RateLimiter;
 use engipay_api::services::destination_screen::StaticBlockList;
-use engipay_api::{AppState, config::Config, router};
+use engipay_api::{AppState, config::{Config, Env}, router};
 use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
@@ -66,6 +66,20 @@ async fn main() -> anyhow::Result<()> {
         let count = entries.len();
         state.destination_screen = Arc::new(StaticBlockList::new(entries));
         info!(count, path = %path, "withdrawal destination block list loaded");
+    }
+
+    // In production, refuse to start with any fake provider — a misconfigured
+    // production deploy should fail loudly before serving requests, not silently
+    // run with stub KYC / price data.
+    if config.env == Env::Production {
+        let fakes = state.fake_providers();
+        if !fakes.is_empty() {
+            anyhow::bail!(
+                "ENGIPAY_ENV=production but the following providers are fakes: {}. \
+                 Configure real credentials or unset ENGIPAY_ENV.",
+                fakes.join(", ")
+            );
+        }
     }
 
     let app = router(state, &config);

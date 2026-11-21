@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use engipay_core::{Asset, Money};
+
 use crate::AppState;
 use crate::error::ApiError;
 use crate::routes::auth::AuthUser;
@@ -114,13 +116,10 @@ pub async fn start_deposit(
         .ok_or(ApiError::DatabaseUnavailable)?;
     crate::services::frozen::ensure_not_frozen(pool, user_id.as_uuid()).await?;
 
-    // Validate amount
-    let amt: f64 = request
-        .amount
-        .trim()
-        .parse()
-        .map_err(|_| ApiError::BadRequest("invalid deposit amount".to_owned()))?;
-    if amt <= 0.0 {
+    // Validate amount — exact integer arithmetic, no f64.
+    let money = Money::parse(Asset::Usdc, request.amount.trim())
+        .map_err(|e| ApiError::BadRequest(format!("invalid deposit amount: {e}")))?;
+    if !money.is_positive() {
         return Err(ApiError::BadRequest(
             "deposit amount must be positive".to_owned(),
         ));
@@ -245,13 +244,10 @@ pub async fn start_withdrawal(
         return Err(ApiError::BadRequest("invalid bank_code".to_owned()));
     }
 
-    // Validate amount
-    let amt: f64 = request
-        .amount
-        .trim()
-        .parse()
-        .map_err(|_| ApiError::BadRequest("invalid withdrawal amount".to_owned()))?;
-    if amt <= 0.0 {
+    // Validate amount — exact integer arithmetic, no f64.
+    let money = Money::parse(Asset::Usdc, request.amount.trim())
+        .map_err(|e| ApiError::BadRequest(format!("invalid withdrawal amount: {e}")))?;
+    if !money.is_positive() {
         return Err(ApiError::BadRequest(
             "withdrawal amount must be positive".to_owned(),
         ));
@@ -548,9 +544,9 @@ async fn fetch_anchor_transaction(
         direction: dir,
         status: st,
         amount_requested: amt_req,
-        amount_in,
-        amount_out,
-        amount_fee,
+        amount_in: amt_in,
+        amount_out: amt_out,
+        amount_fee: amt_fee,
         stellar_tx_hash: hash,
         status_message: msg,
         started_at: started.to_rfc3339(),
@@ -563,6 +559,20 @@ async fn fetch_anchor_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engipay_core::MoneyError;
+
+    #[test]
+    fn amount_too_precise_is_rejected() {
+        // USDC has 7 ledger decimals; 8 decimal places (0.00000001) is too fine.
+        let err = Money::parse(Asset::Usdc, "0.00000001").unwrap_err();
+        assert!(matches!(err, MoneyError::TooPrecise { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn amount_zero_is_not_positive() {
+        let m = Money::parse(Asset::Usdc, "0").unwrap();
+        assert!(!m.is_positive());
+    }
 
     #[test]
     fn deposit_request_deserializes() {

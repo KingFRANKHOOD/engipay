@@ -511,3 +511,49 @@ async fn money_moving_endpoints_return_401_without_a_token() {
         );
     }
 }
+
+/// Regression for the placeholder `RateLimiter::new()` bug — the middleware
+/// previously created a fresh bucket on every request, so the rate limit was
+/// never reached. This test drives the real router until it gets 429 and
+/// checks the `Retry-After` response header is present.
+#[tokio::test]
+async fn rate_limiter_returns_429_with_retry_after_header() {
+    let config = Config::for_tests();
+    // Burst capacity of 3 so we don't have to send 60 requests.
+    let app = router(
+        AppState::with_fakes(None, config.clone(), RateLimiter::with_capacity(3.0, 6.0)),
+        &config,
+    );
+
+    let mut last_status = StatusCode::OK;
+    let mut retry_after_header: Option<String> = None;
+
+    for _ in 0..10 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        last_status = response.status();
+        if last_status == StatusCode::TOO_MANY_REQUESTS {
+            retry_after_header = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_owned());
+            break;
+        }
+    }
+
+    assert_eq!(last_status, StatusCode::TOO_MANY_REQUESTS, "rate limiter never triggered");
+    assert!(
+        retry_after_header.is_some(),
+        "429 response must include a Retry-After header"
+    );
+}
